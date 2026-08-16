@@ -11,8 +11,8 @@ depends=('glibc' 'libgcc')
 install=rift.install
 provides=('rift')
 conflicts=('rift' 'rift-bin')
-source_x86_64=("$pkgname-$pkgver-$CARCH.tar.gz::$url/releases/download/v$pkgver/rift-linux-x64.tar.gz")
-source_aarch64=("$pkgname-$pkgver-$CARCH.tar.gz::$url/releases/download/v$pkgver/rift-linux-arm64.tar.gz")
+source_x86_64=("$pkgname-$pkgver-linux-x64.tar.gz::$url/releases/download/v$pkgver/rift-linux-x64.tar.gz")
+source_aarch64=("$pkgname-$pkgver-linux-arm64.tar.gz::$url/releases/download/v$pkgver/rift-linux-arm64.tar.gz")
 sha256sums_x86_64=('{{SHA_X64}}')
 sha256sums_aarch64=('{{SHA_ARM64}}')
 
