@@ -20,6 +20,12 @@ pub struct Limits {
     pub max_history_bytes: u64,
 }
 
+impl Limits {
+    pub(crate) fn exceeded(&self, item_count: usize, stored_bytes: u64) -> bool {
+        item_count > self.max_items || stored_bytes > self.max_history_bytes
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self::from(&Config::default())
@@ -93,24 +99,26 @@ impl Store {
         self.load_index()?
             .items
             .into_iter()
-            .map(|entry| {
-                let formats = self.manifest(&entry.id)?.formats;
-                let text_preview = if entry.sensitive {
-                    None
-                } else {
-                    self.text_preview(&entry.id, &formats)?
-                };
-                let file = text_preview.as_deref().and_then(clipboard_file);
-                let image = self.clipboard_image(&entry.id, &formats);
-                Ok(HistoryItem {
-                    entry,
-                    formats,
-                    text_preview,
-                    file,
-                    image,
-                })
-            })
+            .map(|entry| self.history_item(entry))
             .collect()
+    }
+
+    pub(crate) fn history_item(&self, entry: HistoryEntry) -> Result<HistoryItem, StorageError> {
+        let formats = self.manifest(&entry.id)?.formats;
+        let text_preview = if entry.sensitive {
+            None
+        } else {
+            self.text_preview(&entry.id, &formats)?
+        };
+        let file = text_preview.as_deref().and_then(clipboard_file);
+        let image = self.clipboard_image(&entry.id, &formats);
+        Ok(HistoryItem {
+            entry,
+            formats,
+            text_preview,
+            file,
+            image,
+        })
     }
 
     fn clipboard_image(&self, id: &str, formats: &[StoredFormat]) -> Option<ClipboardImage> {
@@ -329,7 +337,7 @@ impl Store {
             .iter()
             .map(|entry| entry.stored_bytes)
             .sum::<u64>();
-        while index.items.len() > self.limits.max_items || total > self.limits.max_history_bytes {
+        while self.limits.exceeded(index.items.len(), total) {
             let Some(entry) = index.items.pop() else {
                 break;
             };

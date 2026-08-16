@@ -23,7 +23,8 @@ use wayrs_protocols::wlr_data_control_unstable_v1::{
 
 use crate::api::{Request, Response};
 use crate::config::{API_TIMEOUT, Config};
-use crate::storage::{IncomingFormat, IncomingItem, Store};
+use crate::model::{HistoryEntry, HistoryItem};
+use crate::storage::{IncomingFormat, IncomingItem, Limits, Store};
 
 #[derive(Debug)]
 struct Offer {
@@ -48,11 +49,54 @@ struct ActiveSource {
 }
 
 #[derive(Debug)]
+struct HistoryCache {
+    items: Vec<HistoryItem>,
+    limits: Limits,
+}
+
+impl HistoryCache {
+    fn new(items: Vec<HistoryItem>, limits: Limits) -> Self {
+        Self { items, limits }
+    }
+
+    fn upsert(&mut self, item: HistoryItem) {
+        self.items
+            .retain(|existing| existing.entry.id != item.entry.id);
+        self.items.insert(0, item);
+        while self.limits.exceeded(
+            self.items.len(),
+            self.items.iter().map(|item| item.entry.stored_bytes).sum(),
+        ) {
+            self.items.pop();
+        }
+    }
+
+    fn activate(&mut self, entry: HistoryEntry) -> bool {
+        let Some(position) = self.items.iter().position(|item| item.entry.id == entry.id) else {
+            return false;
+        };
+        let mut item = self.items.remove(position);
+        item.entry = entry;
+        self.items.insert(0, item);
+        true
+    }
+
+    fn delete(&mut self, id: &str) {
+        self.items.retain(|item| item.entry.id != id);
+    }
+
+    fn stored_bytes(&self) -> u64 {
+        self.items.iter().map(|item| item.entry.stored_bytes).sum()
+    }
+}
+
+#[derive(Debug)]
 struct State {
     manager: ZwlrDataControlManagerV1,
     seats: HashMap<u32, Seat>,
     selections: VecDeque<Selection>,
     sensitive_expiration: Option<tokio::task::JoinHandle<()>>,
+    history: HistoryCache,
 }
 
 #[derive(Debug)]
@@ -76,6 +120,7 @@ pub async fn observe(
         seats: HashMap::new(),
         selections: VecDeque::new(),
         sensitive_expiration: None,
+        history: HistoryCache::new(store.list_items()?, Limits::from(config)),
     };
 
     connection.add_registry_cb(registry_event);
@@ -129,6 +174,7 @@ pub async fn observe(
                             let complete = incoming.complete;
                             let stored_formats = incoming.formats.len();
                             let entry = store.store(incoming)?;
+                            state.history.upsert(store.history_item(entry.clone())?);
                             info!(
                                 seat = seat_name,
                                 id = &entry.id[..12],
@@ -233,7 +279,7 @@ fn execute_api(
 ) -> Response {
     let result = (|| -> Result<Response, Box<dyn std::error::Error>> {
         match request {
-            Request::List => Ok(Response::success(store.list_items()?)),
+            Request::List => Ok(Response::success(&state.history.items)),
             Request::Show { id } => {
                 let id = store.resolve_id(&id)?;
                 Ok(Response::success(store.manifest(&id)?))
@@ -241,6 +287,9 @@ fn execute_api(
             Request::Use { id } => {
                 let id = store.resolve_id(&id)?;
                 let entry = store.activate(&id)?;
+                if !state.history.activate(entry.clone()) {
+                    state.history.upsert(store.history_item(entry.clone())?);
+                }
                 cancel_sensitive_expiration(state);
                 let seats = state.seats.keys().copied().collect::<Vec<_>>();
                 if seats.is_empty() {
@@ -261,22 +310,21 @@ fn execute_api(
             Request::Delete { id } => {
                 let id = store.resolve_id(&id)?;
                 store.delete(&id)?;
+                state.history.delete(&id);
                 Ok(Response::empty())
             }
             Request::Clear => {
                 store.clear()?;
+                state.history.items.clear();
                 Ok(Response::empty())
             }
-            Request::Status => {
-                let index = store.load_index()?;
-                Ok(Response::success(serde_json::json!({
-                    "stored_items": index.items.len(),
-                    "stored_bytes": index.items.iter().map(|item| item.stored_bytes).sum::<u64>(),
-                    "assume_ownership": assume_ownership,
-                    "config": config,
-                    "seats": state.seats.len(),
-                })))
-            }
+            Request::Status => Ok(Response::success(serde_json::json!({
+                "stored_items": state.history.items.len(),
+                "stored_bytes": state.history.stored_bytes(),
+                "assume_ownership": assume_ownership,
+                "config": config,
+                "seats": state.seats.len(),
+            }))),
         }
     })();
 
@@ -787,7 +835,28 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
-    use super::send_payload;
+    use super::{HistoryCache, send_payload};
+    use crate::config::Config;
+    use crate::model::{HistoryEntry, HistoryItem};
+    use crate::storage::Limits;
+
+    fn history_item(id: &str, stored_bytes: u64) -> HistoryItem {
+        HistoryItem {
+            entry: HistoryEntry {
+                id: id.to_owned(),
+                created_at_ms: 1,
+                last_used_at_ms: 1,
+                sensitive: false,
+                complete: true,
+                stored_bytes,
+                format_count: 1,
+            },
+            formats: Vec::new(),
+            text_preview: None,
+            file: None,
+            image: None,
+        }
+    }
 
     async fn serve_once(file: std::fs::File) -> Vec<u8> {
         let (mut reader, writer) = tokio_pipe::pipe().unwrap();
@@ -801,6 +870,37 @@ mod tests {
         let (send_result, bytes) = tokio::join!(send, receive);
         send_result.unwrap();
         bytes
+    }
+
+    #[test]
+    fn updates_and_limits_cached_history() {
+        let config = Config {
+            max_items: 2,
+            ..Config::default()
+        };
+        let mut cache = HistoryCache::new(vec![history_item("one", 1)], Limits::from(&config));
+
+        cache.upsert(history_item("two", 2));
+        cache.upsert(history_item("three", 3));
+        assert_eq!(
+            cache
+                .items
+                .iter()
+                .map(|item| item.entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["three", "two"]
+        );
+        assert_eq!(cache.stored_bytes(), 5);
+
+        let mut activated = cache.items[1].entry.clone();
+        activated.last_used_at_ms = 2;
+        assert!(cache.activate(activated));
+        assert_eq!(cache.items[0].entry.id, "two");
+        assert_eq!(cache.items[0].entry.last_used_at_ms, 2);
+
+        cache.delete("two");
+        assert_eq!(cache.items.len(), 1);
+        assert!(!cache.activate(history_item("missing", 0).entry));
     }
 
     #[tokio::test]

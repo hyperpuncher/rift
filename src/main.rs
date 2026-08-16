@@ -83,7 +83,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::List { json } => {
             if json {
-                serde_json::to_writer_pretty(std::io::stdout(), &store.list_items()?)?;
+                let cached = daemon_running()
+                    .then(|| daemon_request(&Request::List))
+                    .and_then(Result::ok);
+                if let Some(items) = cached {
+                    serde_json::to_writer(std::io::stdout(), &items)?;
+                } else {
+                    serde_json::to_writer(std::io::stdout(), &store.list_items()?)?;
+                }
                 println!();
             } else {
                 for item in store.load_index()?.items {
