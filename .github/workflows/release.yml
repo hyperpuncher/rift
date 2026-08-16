@@ -104,10 +104,13 @@ jobs:
             -e "s/{{SHA_X64}}/${{ steps.sha.outputs.x64 }}/g" \
             -e "s/{{SHA_ARM64}}/${{ steps.sha.outputs.arm64 }}/g" \
             packaging/aur/PKGBUILD.in > /tmp/PKGBUILD
-          docker run --rm --interactive archlinux:base-devel bash -c '
+          docker run --rm --interactive \
+            --volume "$PWD/packaging/aur/rift.install:/tmp/rift.install:ro" \
+            archlinux:base-devel bash -c '
             useradd --create-home builder
             cat > /home/builder/PKGBUILD
-            chown builder:builder /home/builder/PKGBUILD
+            cp /tmp/rift.install /home/builder/rift.install
+            chown builder:builder /home/builder/PKGBUILD /home/builder/rift.install
             cd /home/builder
             runuser --user builder -- makepkg --printsrcinfo
           ' < /tmp/PKGBUILD > /tmp/.SRCINFO
