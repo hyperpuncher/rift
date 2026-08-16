@@ -35,10 +35,26 @@ rift does not replace `wl-clipboard`, which provides the general-purpose `wl-cop
 
 ## install
 
+### arch linux
+
 ```sh
-cargo install --path . --locked
-rift daemon
+paru -S rift-clipboard-bin
+systemctl --user enable --now rift.service
 ```
+
+### other linux distributions
+
+download the archive for your architecture from the [latest release](https://github.com/hyperpuncher/rift/releases/latest), then install the binary and user service:
+
+```sh
+tar -xzf rift-linux-x64.tar.gz
+sudo install -Dm755 rift /usr/local/bin/rift
+install -Dm644 rift.service ~/.config/systemd/user/rift.service
+systemctl --user daemon-reload
+systemctl --user enable --now rift.service
+```
+
+systems without systemd can start `rift daemon` from the compositor or graphical session autostart.
 
 ## usage
 
@@ -55,6 +71,23 @@ rift daemon
 
 unique id prefixes are accepted.
 
+## configuration
+
+rift creates `$XDG_CONFIG_HOME/rift/config.json`, or `~/.config/rift/config.json`, with these defaults:
+
+```json
+{
+  "max_items": 300,
+  "max_item_mib": 256,
+  "max_history_mib": 2048,
+  "stream_timeout_seconds": 3,
+  "mime_retries": 1,
+  "sensitive_timeout_seconds": 600
+}
+```
+
+restart the daemon after changing the file.
+
 ## storage
 
 history is stored under `$XDG_STATE_HOME/rift`, or `~/.local/state/rift`:
@@ -66,14 +99,6 @@ rift/
     ├── manifest.json
     └── payload-*
 ```
-
-defaults:
-
-- 300 items
-- 256 mib maximum per grouped item
-- 2 gib maximum history
-- 3 second stream timeout with one retry
-- 10 minute lifetime for restored sensitive items
 
 the private newline-delimited json api listens on `$XDG_RUNTIME_DIR/rift.sock`.
 
