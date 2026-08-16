@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures_util::future::join_all;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 use wayrs_client::global::{BindError, GlobalExt};
 use wayrs_client::object::{ObjectId, Proxy};
@@ -21,7 +21,7 @@ use wayrs_protocols::wlr_data_control_unstable_v1::{
     zwlr_data_control_source_v1,
 };
 
-use crate::api::{Request, Response};
+use crate::api::{Event, HistoryAction, Request, Response};
 use crate::config::{API_TIMEOUT, Config};
 use crate::model::{HistoryEntry, HistoryItem};
 use crate::storage::{IncomingFormat, IncomingItem, Limits, Store};
@@ -97,6 +97,8 @@ struct State {
     selections: VecDeque<Selection>,
     sensitive_expiration: Option<tokio::task::JoinHandle<()>>,
     history: HistoryCache,
+    history_revision: u64,
+    history_events: broadcast::Sender<Event>,
 }
 
 #[derive(Debug)]
@@ -115,12 +117,15 @@ pub async fn observe(
     let manager = connection.bind_singleton::<ZwlrDataControlManagerV1>(1..=2)?;
     #[expect(deprecated)]
     let mut connection = connection.clear_callbacks::<State>();
+    let (history_events, _) = broadcast::channel(32);
     let mut state = State {
         manager,
         seats: HashMap::new(),
         selections: VecDeque::new(),
         sensitive_expiration: None,
         history: HistoryCache::new(store.list_items()?, Limits::from(config)),
+        history_revision: 0,
+        history_events,
     };
 
     connection.add_registry_cb(registry_event);
@@ -175,6 +180,11 @@ pub async fn observe(
                             let stored_formats = incoming.formats.len();
                             let entry = store.store(incoming)?;
                             state.history.upsert(store.history_item(entry.clone())?);
+                            publish_history_event(
+                                &mut state,
+                                HistoryAction::Stored,
+                                Some(entry.id.clone()),
+                            );
                             info!(
                                 seat = seat_name,
                                 id = &entry.id[..12],
@@ -232,39 +242,80 @@ async fn handle_api(
     expiration_tx: mpsc::UnboundedSender<String>,
 ) {
     let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
     let mut line = String::new();
-    let response = match tokio::time::timeout(
-        API_TIMEOUT,
-        tokio::io::BufReader::new(reader).read_line(&mut line),
-    )
-    .await
-    {
-        Err(_) => Response::failure("API request timed out"),
-        Ok(Err(error)) => Response::failure(error),
-        Ok(Ok(0)) => Response::failure("empty API request"),
-        Ok(Ok(_)) => match serde_json::from_str::<Request>(&line) {
-            Ok(request) => execute_api(
-                request,
-                connection,
-                state,
-                store,
-                config,
-                assume_ownership,
-                expiration_tx,
-            ),
-            Err(error) => Response::failure(error),
-        },
+    let request = match tokio::time::timeout(API_TIMEOUT, reader.read_line(&mut line)).await {
+        Err(_) => Err(Response::failure("API request timed out")),
+        Ok(Err(error)) => Err(Response::failure(error)),
+        Ok(Ok(0)) => Err(Response::failure("empty API request")),
+        Ok(Ok(_)) => serde_json::from_str::<Request>(&line).map_err(Response::failure),
     };
 
-    let write_result = async {
-        let bytes = serde_json::to_vec(&response)?;
-        writer.write_all(&bytes).await?;
-        writer.write_all(b"\n").await?;
-        writer.shutdown().await
+    let request = match request {
+        Ok(request) => request,
+        Err(response) => {
+            if let Err(error) = write_api_message(&mut writer, &response).await {
+                warn!(%error, "failed to write API response");
+            }
+            return;
+        }
+    };
+
+    if matches!(request, Request::Subscribe) {
+        let receiver = state.history_events.subscribe();
+        let response = Response::success(serde_json::json!({
+            "revision": state.history_revision,
+        }));
+        if let Err(error) = write_api_message(&mut writer, &response).await {
+            warn!(%error, "failed to start API subscription");
+            return;
+        }
+        tokio::spawn(stream_history_events(reader.into_inner(), writer, receiver));
+        return;
     }
-    .await;
-    if let Err(error) = write_result {
+
+    let response = execute_api(
+        request,
+        connection,
+        state,
+        store,
+        config,
+        assume_ownership,
+        expiration_tx,
+    );
+    if let Err(error) = write_api_message(&mut writer, &response).await {
         warn!(%error, "failed to write API response");
+    }
+}
+
+async fn write_api_message<T: serde::Serialize>(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    message: &T,
+) -> Result<(), std::io::Error> {
+    let bytes = serde_json::to_vec(message).map_err(std::io::Error::other)?;
+    writer.write_all(&bytes).await?;
+    writer.write_all(b"\n").await
+}
+
+async fn stream_history_events(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut receiver: broadcast::Receiver<Event>,
+) {
+    let mut input = [0];
+    loop {
+        tokio::select! {
+            _ = reader.read(&mut input) => return,
+            event = receiver.recv() => match event {
+                Ok(event) => {
+                    if write_api_message(&mut writer, &event).await.is_err() {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
     }
 }
 
@@ -280,6 +331,7 @@ fn execute_api(
     let result = (|| -> Result<Response, Box<dyn std::error::Error>> {
         match request {
             Request::List => Ok(Response::success(&state.history.items)),
+            Request::Subscribe => Ok(Response::failure("subscription was not upgraded")),
             Request::Show { id } => {
                 let id = store.resolve_id(&id)?;
                 Ok(Response::success(store.manifest(&id)?))
@@ -305,17 +357,20 @@ fn execute_api(
                         let _ = expiration_tx.send(id);
                     }));
                 }
+                publish_history_event(state, HistoryAction::Activated, Some(entry.id.clone()));
                 Ok(Response::success(entry))
             }
             Request::Delete { id } => {
                 let id = store.resolve_id(&id)?;
                 store.delete(&id)?;
                 state.history.delete(&id);
+                publish_history_event(state, HistoryAction::Deleted, Some(id));
                 Ok(Response::empty())
             }
             Request::Clear => {
                 store.clear()?;
                 state.history.items.clear();
+                publish_history_event(state, HistoryAction::Cleared, None);
                 Ok(Response::empty())
             }
             Request::Status => Ok(Response::success(serde_json::json!({
@@ -329,6 +384,15 @@ fn execute_api(
     })();
 
     result.unwrap_or_else(Response::failure)
+}
+
+fn publish_history_event(state: &mut State, action: HistoryAction, id: Option<String>) {
+    state.history_revision = state.history_revision.wrapping_add(1);
+    let _ = state.history_events.send(Event::HistoryChanged {
+        revision: state.history_revision,
+        action,
+        id,
+    });
 }
 
 fn cancel_sensitive_expiration(state: &mut State) {

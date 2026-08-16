@@ -67,6 +67,7 @@ systems without systemd can start `rift daemon` from the compositor or graphical
 | `rift use <id>` | restore an item with all its formats |
 | `rift delete <id>` | remove one history item |
 | `rift clear` | remove all history |
+| `rift watch` | stream history change events as newline-delimited json |
 | `rift status` | show daemon, storage, and limit information |
 
 unique id prefixes are accepted.
@@ -100,7 +101,7 @@ rift/
     └── payload-*
 ```
 
-the private newline-delimited json api listens on `$XDG_RUNTIME_DIR/rift.sock`.
+the private newline-delimited json api listens on `$XDG_RUNTIME_DIR/rift.sock`. a `subscribe` request streams revisioned events when history is stored, activated, deleted, or cleared.
 
 ## license
 

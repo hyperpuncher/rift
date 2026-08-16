@@ -10,11 +10,32 @@ use crate::config;
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
     List,
+    Subscribe,
     Show { id: String },
     Use { id: String },
     Delete { id: String },
     Clear,
     Status,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryAction {
+    Stored,
+    Activated,
+    Deleted,
+    Cleared,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum Event {
+    HistoryChanged {
+        revision: u64,
+        action: HistoryAction,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -56,6 +77,25 @@ impl Response {
 }
 
 pub fn request(request: &Request) -> Result<Response, ApiError> {
+    let mut reader = connect(request)?;
+    read_response(&mut reader)
+}
+
+pub fn subscribe() -> Result<BufReader<UnixStream>, ApiError> {
+    let mut reader = connect(&Request::Subscribe)?;
+    let response = read_response(&mut reader)?;
+    if !response.ok {
+        return Err(ApiError::Daemon(
+            response
+                .error
+                .unwrap_or_else(|| "subscription failed".to_owned()),
+        ));
+    }
+    reader.get_mut().set_read_timeout(None)?;
+    Ok(reader)
+}
+
+fn connect(request: &Request) -> Result<BufReader<UnixStream>, ApiError> {
     let mut stream = UnixStream::connect(config::socket_path()?)?;
     let timeout = Some(crate::config::API_TIMEOUT);
     stream.set_read_timeout(timeout)?;
@@ -63,9 +103,12 @@ pub fn request(request: &Request) -> Result<Response, ApiError> {
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
+    Ok(BufReader::new(stream))
+}
 
+fn read_response(reader: &mut BufReader<UnixStream>) -> Result<Response, ApiError> {
     let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
+    reader.read_line(&mut response)?;
     if response.is_empty() {
         return Err(ApiError::EmptyResponse);
     }
@@ -82,4 +125,28 @@ pub enum ApiError {
     Json(#[from] serde_json::Error),
     #[error("daemon returned an empty response")]
     EmptyResponse,
+    #[error("daemon error: {0}")]
+    Daemon(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, HistoryAction, Request};
+
+    #[test]
+    fn serializes_subscription_protocol() {
+        assert_eq!(
+            serde_json::to_string(&Request::Subscribe).unwrap(),
+            r#"{"command":"subscribe"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Event::HistoryChanged {
+                revision: 3,
+                action: HistoryAction::Deleted,
+                id: Some("item-id".to_owned()),
+            })
+            .unwrap(),
+            r#"{"event":"history_changed","revision":3,"action":"deleted","id":"item-id"}"#
+        );
+    }
 }

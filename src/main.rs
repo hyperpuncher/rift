@@ -1,3 +1,4 @@
+use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -41,6 +42,8 @@ enum Command {
     Delete { id: String },
     /// Remove all history items.
     Clear,
+    /// Stream history change events as newline-delimited JSON.
+    Watch,
     /// Show daemon and storage settings.
     Status,
 }
@@ -135,6 +138,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             runtime.block_on(rift::wayland::observe(&store, &settings, !observe_only))?;
+        }
+        Command::Watch => {
+            let mut stdout = std::io::stdout().lock();
+            for event in api::subscribe()?.lines() {
+                writeln!(stdout, "{}", event?)?;
+                stdout.flush()?;
+            }
         }
         Command::Status => {
             let index = store.load_index()?;
