@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use rift::api::{self, Request};
 use rift::config;
-use rift::storage::Store;
+use rift::storage::{Limits, Store};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -47,6 +47,7 @@ enum Command {
 
 #[derive(Debug, Serialize)]
 struct Status {
+    config_file: String,
     state_directory: String,
     stored_items: usize,
     stored_bytes: u64,
@@ -54,6 +55,7 @@ struct Status {
     maximum_item_bytes: u64,
     maximum_history_bytes: u64,
     mime_inactivity_timeout_seconds: u64,
+    mime_retries: usize,
     sensitive_activation_timeout_seconds: u64,
     daemon_running: bool,
     assume_ownership: Option<bool>,
@@ -74,8 +76,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let (settings, config_file) = config::Config::load_or_create()?;
     let state_dir = config::state_dir()?;
-    let store = Store::open(state_dir.clone())?;
+    let store = Store::with_limits(state_dir.clone(), Limits::from(&settings))?;
 
     match cli.command {
         Command::List { json } => {
@@ -124,21 +127,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(rift::wayland::observe(&store, !observe_only))?;
+            runtime.block_on(rift::wayland::observe(&store, &settings, !observe_only))?;
         }
         Command::Status => {
             let index = store.load_index()?;
             let daemon_status = daemon_status();
+            let effective_settings = daemon_status
+                .as_ref()
+                .and_then(|data| data.get("config"))
+                .and_then(|config| serde_json::from_value(config.clone()).ok())
+                .unwrap_or_else(|| settings.clone());
             let status = Status {
+                config_file: config_file.display().to_string(),
                 state_directory: state_dir.display().to_string(),
                 stored_items: index.items.len(),
                 stored_bytes: index.items.iter().map(|item| item.stored_bytes).sum(),
-                maximum_items: config::MAX_ITEMS,
-                maximum_item_bytes: config::MAX_ITEM_BYTES,
-                maximum_history_bytes: config::MAX_HISTORY_BYTES,
-                mime_inactivity_timeout_seconds: config::MIME_INACTIVITY_TIMEOUT.as_secs(),
-                sensitive_activation_timeout_seconds: config::SENSITIVE_ACTIVATION_TIMEOUT
-                    .as_secs(),
+                maximum_items: effective_settings.max_items,
+                maximum_item_bytes: effective_settings.max_item_bytes(),
+                maximum_history_bytes: effective_settings.max_history_bytes(),
+                mime_inactivity_timeout_seconds: effective_settings.stream_timeout_seconds,
+                mime_retries: effective_settings.mime_retries,
+                sensitive_activation_timeout_seconds: effective_settings.sensitive_timeout_seconds,
                 daemon_running: daemon_status.is_some(),
                 assume_ownership: daemon_status
                     .as_ref()

@@ -6,11 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::{Builder, NamedTempFile};
 
-use crate::config::{MAX_HISTORY_BYTES, MAX_ITEM_BYTES, MAX_ITEMS};
+use crate::config::Config;
 use crate::model::{
     ClipboardFile, ClipboardImage, HistoryEntry, HistoryIndex, HistoryItem, Manifest,
     SCHEMA_VERSION, StoredFormat,
 };
+use crate::private_fs::{set_private_dir, set_private_file};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -21,10 +22,16 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
+        Self::from(&Config::default())
+    }
+}
+
+impl From<&Config> for Limits {
+    fn from(config: &Config) -> Self {
         Self {
-            max_items: MAX_ITEMS,
-            max_item_bytes: MAX_ITEM_BYTES,
-            max_history_bytes: MAX_HISTORY_BYTES,
+            max_items: config.max_items,
+            max_item_bytes: config.max_item_bytes(),
+            max_history_bytes: config.max_history_bytes(),
         }
     }
 }
@@ -539,28 +546,6 @@ fn now_ms() -> Result<u64, StorageError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| StorageError::InvalidSystemTime)?
         .as_millis() as u64)
-}
-
-#[cfg(unix)]
-fn set_private_dir(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_private_dir(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]

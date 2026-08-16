@@ -22,9 +22,7 @@ use wayrs_protocols::wlr_data_control_unstable_v1::{
 };
 
 use crate::api::{Request, Response};
-use crate::config::{
-    API_TIMEOUT, MAX_ITEM_BYTES, MIME_INACTIVITY_TIMEOUT, SENSITIVE_ACTIVATION_TIMEOUT,
-};
+use crate::config::{API_TIMEOUT, Config};
 use crate::storage::{IncomingFormat, IncomingItem, Store};
 
 #[derive(Debug)]
@@ -63,7 +61,11 @@ enum Selection {
     Clear { seat_name: u32 },
 }
 
-pub async fn observe(store: &Store, assume_ownership: bool) -> Result<(), WaylandError> {
+pub async fn observe(
+    store: &Store,
+    config: &Config,
+    assume_ownership: bool,
+) -> Result<(), WaylandError> {
     let mut connection = Connection::<Infallible>::connect()?;
     connection.async_roundtrip().await?;
     let manager = connection.bind_singleton::<ZwlrDataControlManagerV1>(1..=2)?;
@@ -98,6 +100,7 @@ pub async fn observe(store: &Store, assume_ownership: bool) -> Result<(), Waylan
                     &mut connection,
                     &mut state,
                     store,
+                    config,
                     assume_ownership,
                     expiration_tx.clone(),
                 ).await;
@@ -120,7 +123,7 @@ pub async fn observe(store: &Store, assume_ownership: bool) -> Result<(), Waylan
             match selection {
                 Selection::Offer { seat_name, offer } => {
                     let format_count = offer.mime_types.len();
-                    let captured = capture_offer(&mut connection, offer).await;
+                    let captured = capture_offer(&mut connection, offer, config).await;
                     match captured {
                         Ok((temporary, incoming)) if !incoming.formats.is_empty() => {
                             let complete = incoming.complete;
@@ -178,6 +181,7 @@ async fn handle_api(
     connection: &mut Connection<State>,
     state: &mut State,
     store: &Store,
+    config: &Config,
     assume_ownership: bool,
     expiration_tx: mpsc::UnboundedSender<String>,
 ) {
@@ -198,6 +202,7 @@ async fn handle_api(
                 connection,
                 state,
                 store,
+                config,
                 assume_ownership,
                 expiration_tx,
             ),
@@ -222,6 +227,7 @@ fn execute_api(
     connection: &mut Connection<State>,
     state: &mut State,
     store: &Store,
+    config: &Config,
     assume_ownership: bool,
     expiration_tx: mpsc::UnboundedSender<String>,
 ) -> Response {
@@ -244,8 +250,9 @@ fn execute_api(
                     own_selection(connection, state, store, seat_name, &id)?;
                 }
                 if entry.sensitive {
+                    let sensitive_timeout = config.sensitive_timeout();
                     state.sensitive_expiration = Some(tokio::spawn(async move {
-                        tokio::time::sleep(SENSITIVE_ACTIVATION_TIMEOUT).await;
+                        tokio::time::sleep(sensitive_timeout).await;
                         let _ = expiration_tx.send(id);
                     }));
                 }
@@ -266,6 +273,7 @@ fn execute_api(
                     "stored_items": index.items.len(),
                     "stored_bytes": index.items.iter().map(|item| item.stored_bytes).sum::<u64>(),
                     "assume_ownership": assume_ownership,
+                    "config": config,
                     "seats": state.seats.len(),
                 })))
             }
@@ -322,8 +330,9 @@ impl Drop for SocketGuard {
 async fn capture_offer(
     connection: &mut Connection<State>,
     offer: Offer,
+    config: &Config,
 ) -> Result<(tempfile::TempDir, IncomingItem), CaptureError> {
-    let result = capture_offer_data(connection, &offer).await;
+    let result = capture_offer_data(connection, &offer, config).await;
     offer.proxy.destroy(connection);
     result
 }
@@ -331,6 +340,7 @@ async fn capture_offer(
 async fn capture_offer_data(
     connection: &mut Connection<State>,
     offer: &Offer,
+    config: &Config,
 ) -> Result<(tempfile::TempDir, IncomingItem), CaptureError> {
     let sensitive = offer
         .mime_types
@@ -344,55 +354,51 @@ async fn capture_offer_data(
         .cloned()
         .enumerate()
         .collect::<Vec<_>>();
-    let first_results = read_round(
-        connection,
-        offer.proxy,
-        temporary.path(),
-        &requests,
-        Arc::clone(&total_bytes),
-    )
-    .await?;
-
-    let mut formats = Vec::with_capacity(first_results.len());
-    let mut retry = Vec::new();
-    for (position, mime, result) in first_results {
-        match result {
-            Ok(format) => formats.push(format),
-            Err(CaptureError::TooLarge(limit)) => {
-                return Err(CaptureError::TooLarge(limit));
-            }
-            Err(error) => {
-                debug!(%error, mime, "retrying unreadable clipboard format");
-                retry.push((position, mime));
-            }
-        }
-    }
-
-    let successful_bytes = formats.iter().try_fold(0_u64, |total, format| {
-        Ok::<_, std::io::Error>(total + std::fs::metadata(&format.path)?.len())
-    })?;
-    total_bytes.store(successful_bytes, Ordering::Relaxed);
-
-    let retry_results = read_round(
-        connection,
-        offer.proxy,
-        temporary.path(),
-        &retry,
-        Arc::clone(&total_bytes),
-    )
-    .await?;
-
-    let mut complete = true;
-    for (_position, _mime, result) in retry_results {
-        match result {
-            Ok(format) => formats.push(format),
-            Err(CaptureError::TooLarge(limit)) => return Err(CaptureError::TooLarge(limit)),
-            Err(error) => {
-                complete = false;
-                warn!(%error, "could not read an advertised clipboard format after retry");
+    let mut formats = Vec::with_capacity(requests.len());
+    let mut pending = requests;
+    for attempt in 0..=config.mime_retries {
+        let results = read_round(
+            connection,
+            offer.proxy,
+            temporary.path(),
+            &pending,
+            Arc::clone(&total_bytes),
+            config.max_item_bytes(),
+            config.stream_timeout(),
+        )
+        .await?;
+        let final_attempt = attempt == config.mime_retries;
+        let mut failed = Vec::new();
+        for (position, mime, result) in results {
+            match result {
+                Ok(format) => formats.push(format),
+                Err(CaptureError::TooLarge(limit)) => {
+                    return Err(CaptureError::TooLarge(limit));
+                }
+                Err(error) if final_attempt => {
+                    warn!(%error, mime, attempts = attempt + 1, "could not read advertised clipboard format");
+                    failed.push((position, mime));
+                }
+                Err(error) => {
+                    debug!(%error, mime, attempt = attempt + 1, "retrying unreadable clipboard format");
+                    failed.push((position, mime));
+                }
             }
         }
+        pending = failed;
+        if pending.is_empty() {
+            break;
+        }
+
+        let successful_bytes = formats.iter().try_fold(0_u64, |total, format| {
+            let size = std::fs::metadata(&format.path)?.len();
+            total
+                .checked_add(size)
+                .ok_or(std::io::Error::other("captured clipboard size overflowed"))
+        })?;
+        total_bytes.store(successful_bytes, Ordering::Relaxed);
     }
+    let complete = pending.is_empty();
     formats.sort_by_key(|format| {
         offer
             .mime_types
@@ -417,6 +423,8 @@ async fn read_round(
     directory: &std::path::Path,
     requests: &[(usize, String)],
     total_bytes: Arc<AtomicU64>,
+    max_item_bytes: u64,
+    stream_timeout: std::time::Duration,
 ) -> Result<Vec<(usize, String, Result<IncomingFormat, CaptureError>)>, CaptureError> {
     let mut readers = Vec::with_capacity(requests.len());
     for (position, mime) in requests {
@@ -428,7 +436,15 @@ async fn read_round(
         let total_bytes = Arc::clone(&total_bytes);
         let position = *position;
         readers.push(async move {
-            let result = read_payload(mime.clone(), path, reader, total_bytes).await;
+            let result = read_payload(
+                mime.clone(),
+                path,
+                reader,
+                total_bytes,
+                max_item_bytes,
+                stream_timeout,
+            )
+            .await;
             (position, mime, result)
         });
     }
@@ -441,12 +457,14 @@ async fn read_payload(
     path: std::path::PathBuf,
     mut reader: tokio_pipe::PipeRead,
     total_bytes: Arc<AtomicU64>,
+    max_item_bytes: u64,
+    stream_timeout: std::time::Duration,
 ) -> Result<IncomingFormat, CaptureError> {
     let mut file = tokio::fs::File::create(&path).await?;
     let mut buffer = vec![0_u8; 64 * 1024];
 
     loop {
-        let count = tokio::time::timeout(MIME_INACTIVITY_TIMEOUT, reader.read(&mut buffer))
+        let count = tokio::time::timeout(stream_timeout, reader.read(&mut buffer))
             .await
             .map_err(|_| CaptureError::Timeout(mime.clone()))??;
         if count == 0 {
@@ -458,9 +476,9 @@ async fn read_payload(
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current
                     .checked_add(count_u64)
-                    .filter(|total| *total <= MAX_ITEM_BYTES)
+                    .filter(|total| *total <= max_item_bytes)
             })
-            .map_err(|_| CaptureError::TooLarge(MAX_ITEM_BYTES))?;
+            .map_err(|_| CaptureError::TooLarge(max_item_bytes))?;
         file.write_all(&buffer[..count]).await?;
     }
     file.flush().await?;
@@ -655,7 +673,7 @@ fn device_event(seat_name: u32, context: EventCtx<State, ZwlrDataControlDeviceV1
                 if seat.ignore_next_selection {
                     seat.ignore_next_selection = false;
                     offer.proxy.destroy(context.conn);
-                    debug!(seat = seat_name, "ignored Rift's own clipboard offer");
+                    debug!(seat = seat_name, "ignored rift's own clipboard offer");
                     return;
                 }
                 context
@@ -751,7 +769,7 @@ pub enum WaylandError {
     InvalidMime(#[from] std::ffi::NulError),
     #[error(transparent)]
     RuntimeDir(#[from] crate::config::RuntimeDirError),
-    #[error("another Rift daemon is already running")]
+    #[error("another rift daemon is already running")]
     AlreadyRunning,
 }
 
