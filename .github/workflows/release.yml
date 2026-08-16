@@ -42,8 +42,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist/package
-          cp target/release/rift README.md LICENSE dist/package/
-          tar -czf "dist/rift-${{ matrix.name }}.tar.gz" -C dist/package rift README.md LICENSE
+          cp target/release/rift README.md LICENSE packaging/systemd/rift.service dist/package/
+          tar -czf "dist/rift-${{ matrix.name }}.tar.gz" -C dist/package rift rift.service README.md LICENSE
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
@@ -123,9 +123,10 @@ jobs:
           git clone ssh://aur@aur.archlinux.org/rift-clipboard-bin.git /tmp/aur-repo
           cp /tmp/PKGBUILD /tmp/aur-repo/PKGBUILD
           cp /tmp/.SRCINFO /tmp/aur-repo/.SRCINFO
+          cp packaging/aur/rift.install /tmp/aur-repo/rift.install
           cd /tmp/aur-repo
           git config user.name "hyperpuncher"
           git config user.email "39203616+hyperpuncher@users.noreply.github.com"
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO rift.install
           git diff --staged --quiet || git commit -m "upgpkg: rift-clipboard-bin ${GITHUB_REF_NAME#v}"
           git push
