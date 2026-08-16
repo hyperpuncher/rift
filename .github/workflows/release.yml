@@ -70,6 +70,11 @@ jobs:
           find dist -mindepth 1 -type d -empty -delete
           cd dist
           sha256sum rift-* > SHA256SUMS
+      - name: Compute checksums
+        id: sha
+        run: |
+          echo "x64=$(sha256sum dist/rift-linux-x64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "arm64=$(sha256sum dist/rift-linux-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Generate release notes
         run: |
           previous_tag=$(git describe --tags --match "v[0-9]*" --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
@@ -91,3 +96,36 @@ jobs:
         with:
           files: dist/*
           body_path: /tmp/release-notes.md
+      - name: Generate AUR package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed \
+            -e "s/{{VERSION}}/$version/g" \
+            -e "s/{{SHA_X64}}/${{ steps.sha.outputs.x64 }}/g" \
+            -e "s/{{SHA_ARM64}}/${{ steps.sha.outputs.arm64 }}/g" \
+            packaging/aur/PKGBUILD.in > /tmp/PKGBUILD
+          docker run --rm --interactive archlinux:base-devel bash -c '
+            useradd --create-home builder
+            cat > /home/builder/PKGBUILD
+            chown builder:builder /home/builder/PKGBUILD
+            cd /home/builder
+            runuser --user builder -- makepkg --printsrcinfo
+          ' < /tmp/PKGBUILD > /tmp/.SRCINFO
+      - name: Push AUR package
+        env:
+          AUR_KEY: ${{ secrets.AUR_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AUR_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -t ed25519,rsa aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key"
+          git clone ssh://aur@aur.archlinux.org/rift-clipboard-bin.git /tmp/aur-repo
+          cp /tmp/PKGBUILD /tmp/aur-repo/PKGBUILD
+          cp /tmp/.SRCINFO /tmp/aur-repo/.SRCINFO
+          cd /tmp/aur-repo
+          git config user.name "hyperpuncher"
+          git config user.email "39203616+hyperpuncher@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git diff --staged --quiet || git commit -m "upgpkg: rift-clipboard-bin ${GITHUB_REF_NAME#v}"
+          git push
