@@ -391,9 +391,8 @@ async fn capture_offer_data(
         }
 
         let successful_bytes = formats.iter().try_fold(0_u64, |total, format| {
-            let size = std::fs::metadata(&format.path)?.len();
             total
-                .checked_add(size)
+                .checked_add(format.size)
                 .ok_or(std::io::Error::other("captured clipboard size overflowed"))
         })?;
         total_bytes.store(successful_bytes, Ordering::Relaxed);
@@ -462,6 +461,8 @@ async fn read_payload(
 ) -> Result<IncomingFormat, CaptureError> {
     let mut file = tokio::fs::File::create(&path).await?;
     let mut buffer = vec![0_u8; 64 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0_u64;
 
     loop {
         let count = tokio::time::timeout(stream_timeout, reader.read(&mut buffer))
@@ -480,10 +481,17 @@ async fn read_payload(
             })
             .map_err(|_| CaptureError::TooLarge(max_item_bytes))?;
         file.write_all(&buffer[..count]).await?;
+        hasher.update(&buffer[..count]);
+        size += count_u64;
     }
     file.flush().await?;
 
-    Ok(IncomingFormat { mime, path })
+    Ok(IncomingFormat {
+        mime,
+        path,
+        size,
+        hash: hasher.finalize(),
+    })
 }
 
 fn own_selection(

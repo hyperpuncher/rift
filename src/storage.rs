@@ -40,6 +40,8 @@ impl From<&Config> for Limits {
 pub struct IncomingFormat {
     pub mime: String,
     pub path: PathBuf,
+    pub size: u64,
+    pub hash: blake3::Hash,
 }
 
 #[derive(Debug)]
@@ -234,52 +236,42 @@ impl Store {
             return Err(StorageError::EmptyItem);
         }
 
-        let items_dir = self.root.join("items");
-        let staging = Builder::new().prefix(".capture-").tempdir_in(&items_dir)?;
-        set_private_dir(staging.path())?;
-
         let mut aggregate = blake3::Hasher::new();
         let mut formats = Vec::with_capacity(incoming.formats.len());
         let mut known_payloads: HashMap<(String, u64), String> = HashMap::new();
+        let mut unique_payloads = Vec::new();
         let mut stored_bytes = 0_u64;
         let mut logical_bytes = 0_u64;
 
         for (position, format) in incoming.formats.into_iter().enumerate() {
-            let payload_name = format!("payload-{position}");
-            let payload_path = staging.path().join(&payload_name);
-            let (size, hash) = copy_and_hash(
-                &format.path,
-                &payload_path,
-                self.limits.max_item_bytes.saturating_sub(logical_bytes),
-            )?;
             logical_bytes = logical_bytes
-                .checked_add(size)
+                .checked_add(format.size)
                 .ok_or(StorageError::ItemTooLarge(self.limits.max_item_bytes))?;
             if logical_bytes > self.limits.max_item_bytes {
                 return Err(StorageError::ItemTooLarge(self.limits.max_item_bytes));
             }
 
-            let hash = hash.to_hex().to_string();
-            let key = (hash.clone(), size);
-            let stored_payload = if let Some(existing) = known_payloads.get(&key) {
-                fs::remove_file(&payload_path)?;
+            let hash = format.hash.to_hex().to_string();
+            let key = (hash.clone(), format.size);
+            let payload = if let Some(existing) = known_payloads.get(&key) {
                 existing.clone()
             } else {
-                set_private_file(&payload_path)?;
-                stored_bytes += size;
-                known_payloads.insert(key, payload_name.clone());
-                payload_name
+                let payload = format!("payload-{position}");
+                stored_bytes += format.size;
+                known_payloads.insert(key, payload.clone());
+                unique_payloads.push((format.path, payload.clone(), format.size));
+                payload
             };
 
             aggregate.update(&(format.mime.len() as u64).to_le_bytes());
             aggregate.update(format.mime.as_bytes());
-            aggregate.update(&size.to_le_bytes());
+            aggregate.update(&format.size.to_le_bytes());
             aggregate.update(hash.as_bytes());
 
             formats.push(StoredFormat {
                 mime: format.mime,
-                payload: stored_payload,
-                size,
+                payload,
+                size: format.size,
                 hash,
             });
         }
@@ -287,6 +279,7 @@ impl Store {
         aggregate.update(&[u8::from(incoming.sensitive), u8::from(incoming.complete)]);
         let id = aggregate.finalize().to_hex().to_string();
         let now = now_ms()?;
+        let items_dir = self.root.join("items");
         let final_dir = items_dir.join(&id);
         let mut index = self.load_index()?;
         let previous = index.items.iter().find(|entry| entry.id == id).cloned();
@@ -303,6 +296,14 @@ impl Store {
         };
 
         if !final_dir.exists() {
+            let staging = Builder::new().prefix(".capture-").tempdir_in(&items_dir)?;
+            set_private_dir(staging.path())?;
+            for (source, payload, size) in unique_payloads {
+                let destination = staging.path().join(payload);
+                copy_payload(&source, &destination, size)?;
+                File::open(&destination)?.sync_all()?;
+                set_private_file(&destination)?;
+            }
             let manifest = Manifest {
                 version: SCHEMA_VERSION,
                 id: id.clone(),
@@ -503,32 +504,16 @@ const fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn copy_and_hash(
-    source: &Path,
-    destination: &Path,
-    limit: u64,
-) -> Result<(u64, blake3::Hash), StorageError> {
-    let mut input = BufReader::new(File::open(source)?);
-    let mut output = BufWriter::new(File::create(destination)?);
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut size = 0_u64;
-
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        size += read as u64;
-        if size > limit {
-            return Err(StorageError::ItemTooLarge(limit));
-        }
-        hasher.update(&buffer[..read]);
-        output.write_all(&buffer[..read])?;
+fn copy_payload(source: &Path, destination: &Path, expected_size: u64) -> Result<(), StorageError> {
+    let copied = fs::copy(source, destination)?;
+    if copied != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("captured payload changed size from {expected_size} to {copied} bytes"),
+        )
+        .into());
     }
-    output.flush()?;
-    output.get_ref().sync_all()?;
-    Ok((size, hasher.finalize()))
+    Ok(())
 }
 
 fn write_json(path: PathBuf, value: &impl serde::Serialize) -> Result<(), StorageError> {
@@ -586,9 +571,14 @@ mod tests {
         IncomingItem {
             formats: formats
                 .into_iter()
-                .map(|(mime, path)| IncomingFormat {
-                    mime: mime.to_owned(),
-                    path,
+                .map(|(mime, path)| {
+                    let bytes = fs::read(&path).unwrap();
+                    IncomingFormat {
+                        mime: mime.to_owned(),
+                        path,
+                        size: bytes.len() as u64,
+                        hash: blake3::hash(&bytes),
+                    }
                 })
                 .collect(),
             sensitive: false,
@@ -644,8 +634,18 @@ mod tests {
         let second = store
             .store(incoming(vec![("text/plain", second_source)]))
             .unwrap();
+        fs::remove_file(&first_source).unwrap();
         let repeated = store
-            .store(incoming(vec![("text/plain", first_source)]))
+            .store(IncomingItem {
+                formats: vec![IncomingFormat {
+                    mime: "text/plain".to_owned(),
+                    path: first_source,
+                    size: 5,
+                    hash: blake3::hash(b"first"),
+                }],
+                sensitive: false,
+                complete: true,
+            })
             .unwrap();
         let index = store.load_index().unwrap();
 
