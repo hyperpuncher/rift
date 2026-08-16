@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --all-features --locked
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p dist/package
+          cp target/release/rift README.md LICENSE dist/package/
+          tar -czf "dist/rift-${{ matrix.name }}.tar.gz" -C dist/package rift README.md LICENSE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: dist/rift-${{ matrix.name }}.tar.gz
+
+  publish:
+    name: Publish release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+      - name: Prepare artifacts
+        run: |
+          find dist -mindepth 2 -type f -exec mv {} dist/ \;
+          find dist -mindepth 1 -type d -empty -delete
+          cd dist
+          sha256sum rift-* > SHA256SUMS
+      - name: Generate release notes
+        run: |
+          previous_tag=$(git describe --tags --match "v[0-9]*" --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+
+          {
+            echo "### What's Changed"
+            echo
+            if [[ -n "$previous_tag" ]]; then
+              git log --reverse --format="- %s [\`%h\`](${repository_url}/commit/%H)" "${previous_tag}..${GITHUB_REF_NAME}"
+              echo
+              echo "**Full Changelog:** [${previous_tag}...${GITHUB_REF_NAME}](${repository_url}/compare/${previous_tag}...${GITHUB_REF_NAME})"
+            else
+              git log --reverse --format="- %s [\`%h\`](${repository_url}/commit/%H)" "$GITHUB_REF_NAME"
+            fi
+          } > /tmp/release-notes.md
+      - name: GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          body_path: /tmp/release-notes.md
