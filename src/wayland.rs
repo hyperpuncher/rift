@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -570,10 +571,22 @@ fn source_event(seat_name: u32, context: EventCtx<State, ZwlrDataControlSourceV1
 }
 
 async fn send_payload(file: std::fs::File, fd: OwnedFd) -> Result<(), std::io::Error> {
-    let mut input = tokio::fs::File::from_std(file);
-    let mut output = tokio_pipe::PipeWrite::try_from(fd.into_raw_fd())?;
-    tokio::io::copy(&mut input, &mut output).await?;
-    output.shutdown().await
+    tokio::task::spawn_blocking(move || {
+        let mut output = std::fs::File::from(fd);
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut offset = 0_u64;
+
+        loop {
+            let count = file.read_at(&mut buffer, offset)?;
+            if count == 0 {
+                return Ok(());
+            }
+            std::io::Write::write_all(&mut output, &buffer[..count])?;
+            offset += count as u64;
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 fn registry_event(
@@ -750,23 +763,35 @@ mod tests {
 
     use super::send_payload;
 
-    #[tokio::test]
-    async fn serves_payload_bytes_to_a_pipe() {
-        let mut temporary = tempfile::tempfile().unwrap();
-        std::io::Write::write_all(&mut temporary, b"grouped payload").unwrap();
-        std::io::Seek::rewind(&mut temporary).unwrap();
+    async fn serve_once(file: std::fs::File) -> Vec<u8> {
         let (mut reader, writer) = tokio_pipe::pipe().unwrap();
         let fd = unsafe { OwnedFd::from_raw_fd(writer.into_raw_fd()) };
-
-        let send = send_payload(temporary, fd);
+        let send = send_payload(file, fd);
         let receive = async {
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes).await.unwrap();
             bytes
         };
         let (send_result, bytes) = tokio::join!(send, receive);
-
         send_result.unwrap();
-        assert_eq!(bytes, b"grouped payload");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn serves_payload_repeatedly_from_shared_file_handle() {
+        let mut temporary = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut temporary, b"grouped payload").unwrap();
+
+        let first = serve_once(temporary.try_clone().unwrap()).await;
+        let second = serve_once(temporary.try_clone().unwrap()).await;
+        let concurrent = tokio::join!(
+            serve_once(temporary.try_clone().unwrap()),
+            serve_once(temporary.try_clone().unwrap()),
+        );
+
+        assert_eq!(first, b"grouped payload");
+        assert_eq!(second, b"grouped payload");
+        assert_eq!(concurrent.0, b"grouped payload");
+        assert_eq!(concurrent.1, b"grouped payload");
     }
 }
